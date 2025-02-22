@@ -57,14 +57,18 @@ interface IRouter {
 // Interface for the WETH token contract
 interface IWETH {
     function deposit() external payable;
+
     function withdraw(uint256) external;
+
     function transfer(address recipient, uint256 amount)
         external
         returns (bool);
+
     function balanceOf(address account) external view returns (uint256);
 }
 
 contract BlindfoldWallet {
+    using SafeERC20 for IERC20;
     string public ContractName;
     address public owner1;
     address public owner2;
@@ -78,7 +82,9 @@ contract BlindfoldWallet {
     bool public owner2Approval;
     bool public owner3Approval;
     uint256 public approvalTimestamp;
-        // Enable trading
+    // % of withdrawal amount shared with paymaster
+    uint256 public paymasterSharePercentage = 1;
+    // Enable trading
     bool public tradesEnabled;
     // Enable/disable tokens
     mapping(string => bool) public tokenSettings;
@@ -147,6 +153,11 @@ contract BlindfoldWallet {
     EthTransferPaymaster[] public ethTransfersPaymaster;
 
     event ApprovalGranted(address indexed owner, bool approved);
+    event TokenWithdrawn(
+        address indexed token,
+        uint256 amount,
+        address executor
+    );
 
     constructor(
         address _owner1,
@@ -261,7 +272,7 @@ contract BlindfoldWallet {
         );
     }
 
-    // Receive ether and emit a deposit event
+    // Receive ether
     receive() external payable {
         uint256 ownerShare = msg.value / 3;
         ownerBalance[owner1] += ownerShare;
@@ -324,64 +335,58 @@ contract BlindfoldWallet {
     function executeTokenWithdrawal(address token) public onlyOwners {
         require(
             owner1Approval && owner2Approval && owner3Approval,
-            "All owners must approve the withdrawal."
+            "All owners must approve."
         );
         require(
             block.timestamp <= approvalTimestamp + 1 hours,
             "Approval expired."
         );
-        require(
-            !pendingTokenWithdrawals[token].executed,
-            "Token withdrawal already executed."
-        );
+        require(!pendingTokenWithdrawals[token].executed, "Already executed.");
         require(
             pendingTokenWithdrawals[token].amount > 0,
-            "No token withdrawal pending."
+            "No pending withdrawal."
         );
         require(
             pendingTokenWithdrawals[token].requester != msg.sender,
-            "Requester cannot execute the withdrawal."
+            "Requester cannot execute."
+        );
+        // Total amount to be withdrawn
+        uint256 totalAmount = pendingTokenWithdrawals[token].amount;
+        // Calculate paymaster's share (0.5% = 0.5, 1% = 1)
+        uint256 paymasterShare = (totalAmount * paymasterSharePercentage) / 100;
+        uint256 remainingAmount = totalAmount - paymasterShare;
+        // Divide remaining amount among owners
+        uint256 ownerShare = remainingAmount / 3;
+        // Mark withdrawal as executed
+        pendingTokenWithdrawals[token].executed = true;
+        // Record executed withdrawal
+        executedWithdrawals.push(
+            ExecutedWithdrawal({
+                token: token,
+                amount: totalAmount,
+                executor: msg.sender,
+                timestamp: block.timestamp
+            })
         );
 
-        uint256 share = pendingTokenWithdrawals[token].amount / 3; // Divide amount by 3 for all owners
-
-        // Update the pending withdrawal as executed
-        pendingTokenWithdrawals[token].executed = true;
-
-        // Record the executed withdrawal details
-        ExecutedWithdrawal memory newExecutedWithdrawal = ExecutedWithdrawal({
-            token: token,
-            amount: pendingTokenWithdrawals[token].amount,
-            executor: msg.sender,
-            timestamp: block.timestamp
-        });
-
-        // Store the executed withdrawal
-        executedWithdrawals.push(newExecutedWithdrawal);
-
-        // Reset pending token withdrawal after execution
-        WithdrawalRequest memory executedWithdrawal = pendingTokenWithdrawals[
-            token
-        ];
+        // Reset pending withdrawal
         pendingTokenWithdrawals[token] = WithdrawalRequest(
             0,
             0,
             false,
             address(0)
-        ); // Reset the pending withdrawal details
+        );
         resetApprovals();
-        require(
-            IERC20(token).transfer(owner1, share),
-            "Token transfer to owner1 failed."
-        );
-        require(
-            IERC20(token).transfer(owner2, share),
-            "Token transfer to owner2 failed."
-        );
-        require(
-            IERC20(token).transfer(owner3, share),
-            "Token transfer to owner3 failed."
-        );
+
+        // Transfer tokens
+        IERC20(token).safeTransfer(owner1, ownerShare);
+        IERC20(token).safeTransfer(owner2, ownerShare);
+        IERC20(token).safeTransfer(owner3, ownerShare);
+        if (paymasterShare > 0) {
+            IERC20(token).safeTransfer(paymaster, paymasterShare);
+        }
+
+        emit TokenWithdrawn(token, totalAmount, msg.sender);
     }
 
     // native balance
@@ -411,7 +416,7 @@ contract BlindfoldWallet {
             isPluginApproved(address(this), POSITION_ROUTER_ADDRESS),
             "Plugin not approved"
         );
-    require(tradesEnabled, "Trades are currently disabled");
+        require(tradesEnabled, "Trades are currently disabled");
 
         IPositionRouter(POSITION_ROUTER_ADDRESS).createIncreasePosition{
             value: msg.value
@@ -446,7 +451,7 @@ contract BlindfoldWallet {
             isPluginApproved(address(this), POSITION_ROUTER_ADDRESS),
             "Plugin not approved"
         );
-    require(tradesEnabled, "Trades are currently disabled");
+        require(tradesEnabled, "Trades are currently disabled");
 
         address receiver = address(this);
 
@@ -504,40 +509,57 @@ contract BlindfoldWallet {
         tokenSwaps.push(newSwap);
     }
 
-    // Swap tokens to ETH and transfer to itself
+    // Swap WETH into native ETH and transfer to the contract
     function swapTokensToETH(
         address[] memory _path,
         uint256 _amountIn,
         uint256 _minOut
     ) external onlyOwnersOrPaymaster {
-        // Ensure the output token in the path is WETH
+        require(_path.length > 0, "Invalid path");
+
+        // Ensure the last token in the path is WETH
         require(
             _path[_path.length - 1] == WETH_ADDRESS,
             "Router: invalid _path"
         );
 
-        // Ensure the contract is the receiver
         address payable receiver = payable(address(this));
 
-        // Approve the tokens if necessary
-        uint256 currentAllowance = IERC20(_path[0]).allowance(
-            address(this),
-            ROUTER_ADDRESS
-        );
-        if (currentAllowance < _amountIn) {
+        if (_path[0] == WETH_ADDRESS) {
+            // If we are directly dealing with WETH, just unwrap it to ETH
             require(
-                IERC20(_path[0]).approve(ROUTER_ADDRESS, _amountIn),
-                "Token approval failed."
+                IERC20(WETH_ADDRESS).balanceOf(address(this)) >= _amountIn,
+                "Insufficient WETH balance"
+            );
+
+            // Transfer WETH to this contract if necessary (not needed if already held)
+            if (
+                IERC20(WETH_ADDRESS).allowance(address(this), ROUTER_ADDRESS) <
+                _amountIn
+            ) {
+                IERC20(WETH_ADDRESS).approve(ROUTER_ADDRESS, _amountIn);
+            }
+
+            // Unwrap WETH to ETH
+            IWETH(WETH_ADDRESS).withdraw(_amountIn);
+        } else {
+            // Otherwise, swap tokens to ETH using the router
+            uint256 currentAllowance = IERC20(_path[0]).allowance(
+                address(this),
+                ROUTER_ADDRESS
+            );
+            if (currentAllowance < _amountIn) {
+                IERC20(_path[0]).approve(ROUTER_ADDRESS, _amountIn);
+            }
+
+            // Call the swapToETH function on the Router contract
+            IRouter(ROUTER_ADDRESS).swapTokensToETH(
+                _path,
+                _amountIn,
+                _minOut,
+                receiver
             );
         }
-
-        // Call the swapToETH function on the Router contract
-        IRouter(ROUTER_ADDRESS).swapTokensToETH(
-            _path,
-            _amountIn,
-            _minOut,
-            receiver
-        );
     }
 
     // Function to transfer native ETH tokens to the paymaster address with a cap and daily limit
@@ -585,16 +607,27 @@ contract BlindfoldWallet {
     }
 
     // Enable/disable trading
-     function setTradeStatus(bool _enabled) external onlyOwnersOrPaymaster {
+    function setTradeStatus(bool _enabled) external onlyOwnersOrPaymaster {
         tradesEnabled = _enabled;
     }
 
     // enable/disable tokens
-     function setTokenStatus(string memory token, bool status) external onlyOwners {
+    function setTokenStatus(string memory token, bool status)
+        external
+        onlyOwners
+    {
         tokenSettings[token] = status;
     }
 
     function getTokenStatus(string memory token) external view returns (bool) {
         return tokenSettings[token];
+    }
+
+    function setPaymasterSharePercentage(uint256 _percentage)
+        external
+        onlyOwners
+    {
+        require(_percentage <= 10, "Max paymaster share: 10%");
+        paymasterSharePercentage = _percentage;
     }
 }
